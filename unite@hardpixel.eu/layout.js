@@ -1,255 +1,220 @@
-const GObject     = imports.gi.GObject
-const St          = imports.gi.St
-const Clutter     = imports.gi.Clutter
-const GtkSettings = imports.gi.Gtk.Settings.get_default()
-const Main        = imports.ui.main
-const Config      = imports.misc.config
-const Unite       = imports.misc.extensionUtils.getCurrentExtension()
-const AppMenu     = Main.panel.statusArea.appMenu
-const AggMenu     = Main.panel.statusArea.aggregateMenu
-const Handlers    = Unite.imports.handlers
+const GObject  = imports.gi.GObject
+const St       = imports.gi.St
+const Clutter  = imports.gi.Clutter
+const Main     = imports.ui.main
+const Me       = imports.misc.extensionUtils.getCurrentExtension()
+const AppMenu  = Main.panel.statusArea.appMenu
+const Handlers = Me.imports.handlers
+const Override = Me.imports.overrides.helper
 
-const VERSION = parseInt(Config.PACKAGE_VERSION.split('.')[1])
+var WidgetArrow = class WidgetArrow {
+  constructor(widget) {
+    this.widget = widget || {}
 
-function actorHasClass(actor, name) {
-  return actor.has_style_class_name && actor.has_style_class_name(name)
-}
-
-function getWidgetArrow(widget) {
-  let arrow = widget._arrow
-
-  if (!arrow) {
-    const last  = widget.get_n_children() - 1
-    const actor = widget.get_children()[last]
-
-    if (actor) {
-      if (actorHasClass(actor, 'popup-menu-arrow')) {
-        arrow = actor
-      } else {
-        arrow = getWidgetArrow(actor)
-      }
+    if (!this.widget.hasOwnProperty('_arrow')) {
+      this._findActor(this.widget)
     }
   }
 
-  if (arrow && !widget.hasOwnProperty('_arrow')) {
-    widget._arrow = arrow
+  get arrow() {
+    return this.widget._arrow || {}
   }
 
-  return arrow
+  _findActor(widget) {
+    if (widget.hasOwnProperty('_arrow')) {
+      return this.widget._arrow = widget._arrow
+    }
+
+    const actor = widget.last_child
+    const klass = actor && actor.has_style_class_name
+    const cname = name => klass && actor.has_style_class_name(name)
+
+    if (cname('popup-menu-arrow')) {
+      return this.widget._arrow = actor
+    }
+
+    actor && this._findActor(actor)
+  }
+
+  hide() {
+    if (!this.widget._arrowRemoved) {
+      this.arrow.visible = false
+      this.widget._arrowRemoved = true
+    }
+  }
+
+  show() {
+    if (this.widget._arrowRemoved) {
+      this.arrow.visible = true
+      delete this.widget._arrowRemoved
+    }
+  }
 }
 
-function toggleWidgetArrow(widget, hide) {
-  const arrow = widget && getWidgetArrow(widget)
+var Messages = class Messages extends Handlers.Feature {
+  constructor() {
+    super('notifications-position', setting => setting != 'center')
+  }
 
-  if (arrow) {
-    if (hide && !widget._arrowHandled) {
-      arrow.visible = false
-      widget._arrowHandled = true
+  activate() {
+    this.settings = new Handlers.Settings()
+
+    this.settings.connect(
+      'notifications-position', this._onPositionChange.bind(this)
+    )
+
+    this._onPositionChange()
+  }
+
+  get position() {
+    const mapping = { left: 'START', right: 'END' }
+    const setting = this.settings.get('notifications-position')
+
+    return mapping[setting]
+  }
+
+  _onPositionChange() {
+    const banner   = Main.messageTray._bannerBin
+    const context  = St.ThemeContext.get_for_stage(global.stage)
+    const position = Clutter.ActorAlign[this.position]
+
+    banner.set_x_align(position)
+    banner.set_width(390 * context.scale_factor)
+  }
+
+  destroy() {
+    const banner   = Main.messageTray._bannerBin
+    const position = Clutter.ActorAlign.CENTER
+
+    banner.set_x_align(position)
+    banner.set_width(-1)
+
+    this.settings.disconnectAll()
+  }
+}
+
+var AppMenuIcon = class AppMenuIcon extends Handlers.Feature {
+  constructor() {
+    super('hide-app-menu-icon', setting => setting == true)
+
+    Override.inject(this, 'layout', 'AppMenuIconClassic')
+  }
+
+  activate() {
+    AppMenu._iconBox.hide()
+  }
+
+  destroy() {
+    AppMenu._iconBox.show()
+  }
+}
+
+var DropdownArrows = class DropdownArrows extends Handlers.Feature {
+  constructor() {
+    super('hide-dropdown-arrows', setting => setting == true)
+
+    Override.inject(this, 'layout', 'DropdownArrows')
+  }
+
+  activate() {
+    this.signals = new Handlers.Signals()
+
+    for (const box of Main.panel.get_children()) {
+      this.signals.connect(box, 'actor_added', this._onActorAdded.bind(this))
     }
 
-    if (!hide && widget._arrowHandled) {
-      arrow.visible = true
-      delete widget._arrowHandled
+    this._onActorAdded()
+  }
+
+  get arrows() {
+    const items = Main.panel.statusArea
+    const names = Object.keys(items).filter(this._handleWidget.bind(this))
+
+    return names.map(name => new WidgetArrow(items[name]))
+  }
+
+  _handleWidget(name) {
+    return !name.startsWith('unite')
+  }
+
+  _onActorAdded() {
+    this.arrows.forEach(arrow => arrow.hide())
+  }
+
+  destroy() {
+    this.arrows.forEach(arrow => arrow.show())
+    this.signals.disconnectAll()
+  }
+}
+
+var PanelSpacing = class PanelSpacing extends Handlers.Feature {
+  constructor() {
+    super('reduce-panel-spacing', setting => setting == true)
+
+    Override.inject(this, 'layout', 'PanelSpacing')
+    Override.inject(this, 'layout', 'PanelSpacingClassic')
+  }
+
+  activate() {
+    this.styles = new Handlers.Styles()
+    this._injectStyles()
+
+    Main.panel._addStyleClassName('reduce-spacing')
+    this._syncLayout()
+  }
+
+  _injectStyles() {
+    this.styles.addShellStyle('spacing', '@/styles/shell/spacing.css')
+  }
+
+  _syncLayout() {
+    // Fix dateMenu paddings when reduce spacing enabled
+    // when returning from lock screen
+    const dateMenu = Main.panel.statusArea.dateMenu
+    const paddings = this._dateMenuPadding
+
+    if (!paddings) {
+      this._dateMenuPadding = [dateMenu._minHPadding, dateMenu._natHPadding]
+
+      dateMenu._minHPadding = 0
+      dateMenu._natHPadding = 0
+    } else {
+      dateMenu._minHPadding = paddings[0]
+      dateMenu._natHPadding = paddings[1]
+
+      this._dateMenuPadding = null
     }
+
+    dateMenu.queue_relayout()
+  }
+
+  destroy() {
+    Main.panel._removeStyleClassName('reduce-spacing')
+    this.styles.removeAll()
+
+    this._syncLayout()
   }
 }
 
 var LayoutManager = GObject.registerClass(
   class UniteLayoutManager extends GObject.Object {
     _init() {
-      this.signals  = new Handlers.Signals()
-      this.settings = new Handlers.Settings()
-      this.styles   = new Handlers.Styles()
+      this.features = new Handlers.Features()
 
-      this.signals.connect(
-        Main.panel._leftBox, 'actor_added', this._onHideDropdownArrows.bind(this)
-      )
+      this.features.add(Messages)
+      this.features.add(AppMenuIcon)
+      this.features.add(DropdownArrows)
+      this.features.add(PanelSpacing)
 
-      this.signals.connect(
-        Main.panel._centerBox, 'actor_added', this._onHideDropdownArrows.bind(this)
-      )
-
-      this.signals.connect(
-        Main.panel._rightBox, 'actor_added', this._onHideDropdownArrows.bind(this)
-      )
-
-      this.settings.connect(
-        'notifications-position', this._onNotificationsChange.bind(this)
-      )
-
-      this.settings.connect(
-        'hide-app-menu-icon', this._onHideAppMenuIcon.bind(this)
-      )
-
-      this.settings.connect(
-        'hide-app-menu-arrow', this._onHideAppMenuArrow.bind(this)
-      )
-
-      this.settings.connect(
-        'hide-aggregate-menu-arrow', this._onHideAggMenuArrow.bind(this)
-      )
-
-      this.settings.connect(
-        'hide-dropdown-arrows', this._onHideDropdownArrows.bind(this)
-      )
-
-      this.settings.connect(
-        'use-system-fonts', this._onChangeStyles.bind(this)
-      )
-
-      this.settings.connect(
-        'reduce-panel-spacing', this._onChangeStyles.bind(this)
-      )
-
-      if (VERSION < 36) {
-        this.signals.connect(
-          GtkSettings, 'notify::gtk-font-name', this._onChangeStyles.bind(this)
-        )
-      }
-    }
-
-    _onNotificationsChange() {
-      const setting = this.settings.get('notifications-position')
-
-      if (setting != 'center') {
-        const context  = St.ThemeContext.get_for_stage(global.stage)
-        const banner   = Main.messageTray._bannerBin
-        const mappings = { left: 'START', right: 'END' }
-        const position = mappings[setting]
-
-        banner.set_x_align(Clutter.ActorAlign[position])
-        banner.set_width(390 * context.scale_factor)
-      } else {
-        this._resetNotifications()
-      }
-    }
-
-    _onHideAppMenuIcon() {
-      const setting = this.settings.get('hide-app-menu-icon')
-
-      if (setting) {
-        AppMenu._iconBox.hide()
-      } else {
-        this._resetAppMenuIcon()
-      }
-    }
-
-    _onHideAppMenuArrow() {
-      const setting = this.settings.get('hide-app-menu-arrow')
-
-      if (setting) {
-        toggleWidgetArrow(AppMenu, true)
-      } else {
-        this._resetAppMenuArrow()
-      }
-    }
-
-    _onHideAggMenuArrow() {
-      const setting = this.settings.get('hide-aggregate-menu-arrow')
-
-      if (setting) {
-        toggleWidgetArrow(AggMenu, true)
-      } else {
-        this._resetAggMenuArrow()
-      }
-    }
-
-    _onHideDropdownArrows() {
-      const setting = this.settings.get('hide-dropdown-arrows')
-
-      if (setting) {
-        for (const [name, widget] of Object.entries(Main.panel.statusArea)) {
-          if (name != 'aggregateMenu' && name != 'appMenu') {
-            toggleWidgetArrow(widget, true)
-          }
-        }
-      } else {
-        this._resetDropdownArrows()
-      }
-    }
-
-    _onChangeStyles() {
-      const fonts = this.settings.get('use-system-fonts')
-      const space = this.settings.get('reduce-panel-spacing')
-
-      this._resetStyles()
-
-      if (VERSION < 36 && fonts) {
-        const font = GtkSettings.gtk_font_name.replace(/\s\d+$/, '')
-        this.styles.addWidgetStyle('uiGroup', Main.uiGroup, `font-family: ${font};`)
-
-        Main.panel._addStyleClassName('system-fonts')
-      }
-
-      if (space) {
-        Main.panel._addStyleClassName('small-spacing')
-      }
-
-      if (VERSION < 34) {
-        Main.panel._addStyleClassName('extra-spacing')
-      }
-
-      if (fonts || space) {
-        this.styles.addWidgetStyle('panel', Main.panel, 'font-size: 11.25pt;')
-      }
-    }
-
-    _resetNotifications() {
-      const banner = Main.messageTray._bannerBin
-
-      banner.set_x_align(Clutter.ActorAlign.CENTER)
-      banner.set_width(-1)
-    }
-
-    _resetAppMenuIcon() {
-      AppMenu._iconBox.show()
-    }
-
-    _resetAppMenuArrow() {
-      toggleWidgetArrow(AppMenu, false)
-    }
-
-    _resetAggMenuArrow() {
-      toggleWidgetArrow(AggMenu, false)
-    }
-
-    _resetDropdownArrows() {
-      for (const [name, widget] of Object.entries(Main.panel.statusArea)) {
-        if (name != 'aggregateMenu' && name != 'appMenu') {
-          toggleWidgetArrow(widget, false)
-        }
-      }
-    }
-
-    _resetStyles() {
-      Main.panel._removeStyleClassName('system-fonts')
-      Main.panel._removeStyleClassName('small-spacing')
-      Main.panel._removeStyleClassName('extra-spacing')
-
-      this.styles.deleteStyle('uiGroup')
-      this.styles.deleteStyle('panel')
+      Override.inject(this, 'layout', 'LayoutManager')
     }
 
     activate() {
-      this._onNotificationsChange()
-      this._onHideAppMenuIcon()
-      this._onHideAppMenuArrow()
-      this._onHideAggMenuArrow()
-      this._onHideDropdownArrows()
-      this._onChangeStyles()
+      this.features.activate()
     }
 
     destroy() {
-      this._resetNotifications()
-      this._resetAppMenuIcon()
-      this._resetAppMenuArrow()
-      this._resetAggMenuArrow()
-      this._resetDropdownArrows()
-      this._resetStyles()
-
-      this.signals.disconnectAll()
-      this.settings.disconnectAll()
-      this.styles.removeAll()
+      this.features.destroy()
     }
   }
 )

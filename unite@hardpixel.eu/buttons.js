@@ -17,6 +17,7 @@ var DesktopLabel = GObject.registerClass(
       this.label_actor = this._label
 
       this.setText(text || 'Desktop')
+      this.add_style_class_name('desktop-name-label')
     }
 
     setText(text) {
@@ -41,6 +42,7 @@ var TrayIndicator = GObject.registerClass(
       this._indicators = new St.BoxLayout({ style_class: 'panel-status-indicators-box' })
       this.add_child(this._indicators)
 
+      this.add_style_class_name('system-tray-icons')
       this._sync()
     }
 
@@ -50,22 +52,24 @@ var TrayIndicator = GObject.registerClass(
     }
 
     _sync() {
-      this.visible = this._icons.length
+      this.visible = this._icons.length > 0
     }
 
     addIcon(icon) {
       this._icons.push(icon)
 
       const mask = St.ButtonMask.ONE | St.ButtonMask.TWO | St.ButtonMask.THREE
-      const ibtn = new St.Button({ child: icon, button_mask: mask })
+      const ibtn = new St.Button({ child: icon, button_mask: mask, width: this.size })
 
       this._indicators.add_child(ibtn)
 
       icon.connect('destroy', () => { ibtn.destroy() })
-      ibtn.connect('button-release-event', (actor, event) => { icon.click(event) })
+      ibtn.connect('button-release-event', (actor, event) => icon.click(event))
 
       icon.set_reactive(true)
-      icon.set_size(this.size, this.size)
+      icon.set_height(this.size)
+      icon.set_x_align(Clutter.ActorAlign.CENTER)
+      icon.set_y_align(Clutter.ActorAlign.CENTER)
 
       this._sync()
     }
@@ -81,7 +85,7 @@ var TrayIndicator = GObject.registerClass(
     }
 
     forEach(callback) {
-      this._icons.forEach(icon => { callback.call(null, icon) })
+      this._icons.forEach(icon => callback.call(null, icon))
     }
   }
 )
@@ -95,10 +99,12 @@ var WindowControls = GObject.registerClass(
       this.add_child(this._controls)
 
       this.add_style_class_name('window-controls')
+      this.remove_style_class_name('panel-button')
     }
 
     _addButton(action) {
-      const bin = new St.Bin({ style_class: 'icon' })
+      const pos = Clutter.ActorAlign.CENTER
+      const bin = new St.Bin({ style_class: 'icon', x_align: pos, y_align: pos })
       const btn = new St.Button({ track_hover: true })
 
       btn.add_style_class_name(`window-button ${action}`)

@@ -2,21 +2,33 @@ const Bytes       = imports.byteArray
 const Gio         = imports.gi.Gio
 const GLib        = imports.gi.GLib
 const St          = imports.gi.St
-const Unite       = imports.misc.extensionUtils.getCurrentExtension()
-const Convenience = Unite.imports.convenience
+const Main        = imports.ui.main
+const Me          = imports.misc.extensionUtils.getCurrentExtension()
+const Convenience = Me.imports.convenience
 
 const SETTINGS = Convenience.getSettings()
 const WM_PREFS = Convenience.getPreferences()
 
-const USER_CONFIG = GLib.get_user_config_dir()
-const USER_STYLES = `${USER_CONFIG}/gtk-3.0/gtk.css`
+const GTK_VERSIONS = [3, 4]
+const USER_CONFIGS = GLib.get_user_config_dir()
+
+function filePath(parts) {
+  const parse = part => part ? part.replace(/^@/, '') : ''
+  const paths = [Me.path].concat(parts).map(parse)
+
+  return GLib.build_filenamev(paths)
+}
+
+function userStylesPath(version) {
+  return GLib.build_filenamev([USER_CONFIGS, `gtk-${version}.0`, 'gtk.css'])
+}
 
 function fileExists(path) {
   return GLib.file_test(path, GLib.FileTest.EXISTS)
 }
 
 function getGioFile(path) {
-  const absPath = GLib.build_filenamev([Unite.path, path])
+  const absPath = filePath(path)
 
   if (fileExists(absPath)) {
     return Gio.file_new_for_path(absPath)
@@ -33,16 +45,24 @@ function getFileContents(path) {
 }
 
 function setFileContents(path, contents) {
+  if (!fileExists(path)) {
+    const dirname = GLib.path_get_dirname(path)
+    GLib.mkdir_with_parents(dirname, parseInt('0700', 8))
+  }
+
   GLib.file_set_contents(path, contents)
 }
 
 function resetGtkStyles() {
-  let style = getFileContents(USER_STYLES)
+  GTK_VERSIONS.forEach(version => {
+    const filepath = userStylesPath(version)
+    let style = getFileContents(filepath)
 
-  style = style.replace(/\/\* UNITE ([\s\S]*?) UNITE \*\/\n/g, '')
-  style = style.replace(/@import.*unite@hardpixel\.eu.*css['"]\);\n/g, '')
+    style = style.replace(/\/\* UNITE ([\s\S]*?) UNITE \*\/\n/g, '')
+    style = style.replace(/@import.*unite@hardpixel\.eu.*css['"]\);\n/g, '')
 
-  setFileContents(USER_STYLES, style)
+    setFileContents(filepath, style)
+  })
 }
 
 var Signals = class Signals {
@@ -51,14 +71,13 @@ var Signals = class Signals {
   }
 
   registerHandler(object, name, callback) {
-    const key = `${object}[${name}]`
+    const uid = GLib.uuid_string_random()
+    const key = `[signal ${name} uuid@${uid}]`
 
-    if (!this.hasSignal(key)) {
-      this.signals.set(key, {
-        object:   object,
-        signalId: object.connect(name, callback)
-      })
-    }
+    this.signals.set(key, {
+      object:   object,
+      signalId: object.connect(name, callback)
+    })
 
     return key
   }
@@ -111,7 +130,70 @@ var Settings = class Settings extends Signals {
   }
 }
 
-var ShellStyle = class ShellStyle {
+var Feature = class Feature {
+  constructor(setting, callback) {
+    this._settingsKey = setting
+    this._checkActive = callback
+  }
+}
+
+var Features = class Features {
+  constructor() {
+    this.features = []
+    this.settings = new Settings()
+  }
+
+  add(klass) {
+    const feature = new klass()
+    this.features.push(feature)
+
+    const setting = feature._settingsKey
+    const checkCb = feature._checkActive
+
+    feature.activated = false
+
+    const isActive = () => {
+      return checkCb.call(null, this.settings.get(setting))
+    }
+
+    const onChange = () => {
+      const active = isActive()
+
+      if (active && !feature.activated) {
+        feature.activated = true
+        return feature.activate()
+      }
+
+      if (!active && feature.activated) {
+        feature.activated = false
+        return feature.destroy()
+      }
+    }
+
+    feature._doActivate = () => {
+      this.settings.connect(setting, onChange.bind(feature))
+      onChange()
+    }
+
+    feature._doDestroy = () => {
+      if (feature.activated) {
+        feature.destroy()
+        feature.activated = false
+      }
+    }
+  }
+
+  activate() {
+    this.features.forEach(feature => feature._doActivate())
+  }
+
+  destroy() {
+    this.features.forEach(feature => feature._doDestroy())
+    this.settings.disconnectAll()
+  }
+}
+
+class ShellStyle {
   constructor(path) {
     this.file = getGioFile(path)
   }
@@ -133,7 +215,7 @@ var ShellStyle = class ShellStyle {
   }
 }
 
-var WidgetStyle = class WidgetStyle {
+class WidgetStyle {
   constructor(widget, style) {
     this.widget = widget
     this.style  = style
@@ -154,23 +236,50 @@ var WidgetStyle = class WidgetStyle {
   }
 }
 
-var GtkStyle = class GtkStyle {
-  constructor(name, contents) {
-    this.contents = `/* UNITE ${name} */\n${contents}\n/* ${name} UNITE */\n`
+class GtkStyle {
+  constructor(version, name, data) {
+    const content = this.parse(data, version)
+
+    this.filepath = userStylesPath(version)
+    this.contents = `/* UNITE ${name} */\n${content}\n/* ${name} UNITE */\n`
   }
 
   get existing() {
-    return getFileContents(USER_STYLES)
+    return getFileContents(this.filepath)
+  }
+
+  parse(data, ver) {
+    if (data.startsWith('@/')) {
+      const path = filePath(['styles', `gtk${ver}`, data])
+      return `@import url('${path}');`
+    } else {
+      return data
+    }
   }
 
   load() {
     const style = this.contents + this.existing
-    setFileContents(USER_STYLES, style)
+    setFileContents(this.filepath, style)
   }
 
   unload() {
     const style = this.existing.replace(this.contents, '')
-    setFileContents(USER_STYLES, style)
+    setFileContents(this.filepath, style)
+  }
+}
+
+class GtkStyles {
+  constructor(name, data, versions) {
+    const items = [].concat(versions).filter(ver => GTK_VERSIONS.includes(ver))
+    this.styles = items.map(ver => new GtkStyle(ver, name, data))
+  }
+
+  load() {
+    this.styles.forEach(style => style.load())
+  }
+
+  unload() {
+    this.styles.forEach(style => style.unload())
   }
 }
 
@@ -205,9 +314,13 @@ var Styles = class Styles {
     }
   }
 
-  addShellStyle(name, path) {
-    this.deleteStyle(name)
-    this.setStyle(name, ShellStyle, path)
+  addShellStyle(name, data) {
+    if (data.startsWith('@/')) {
+      this.deleteStyle(name)
+      this.setStyle(name, ShellStyle, data)
+    } else {
+      this.addWidgetStyle(name, Main.uiGroup, data)
+    }
   }
 
   addWidgetStyle(name, widget, styles) {
@@ -215,9 +328,9 @@ var Styles = class Styles {
     this.setStyle(name, WidgetStyle, widget, styles)
   }
 
-  addGtkStyle(name, contents) {
+  addGtkStyle(name, contents, versions = GTK_VERSIONS) {
     this.deleteStyle(name)
-    this.setStyle(name, GtkStyle, name, contents)
+    this.setStyle(name, GtkStyles, name, contents, versions)
   }
 
   removeAll() {

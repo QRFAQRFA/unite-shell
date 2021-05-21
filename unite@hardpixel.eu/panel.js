@@ -1,60 +1,28 @@
 const Gi         = imports._gi
 const System     = imports.system
 const GObject    = imports.gi.GObject
+const GLib       = imports.gi.GLib
+const St         = imports.gi.St
+const Pango      = imports.gi.Pango
 const Clutter    = imports.gi.Clutter
+const Meta       = imports.gi.Meta
 const Shell      = imports.gi.Shell
 const AppSystem  = imports.gi.Shell.AppSystem.get_default()
 const WinTracker = imports.gi.Shell.WindowTracker.get_default()
 const Main       = imports.ui.main
-const Unite      = imports.misc.extensionUtils.getCurrentExtension()
+const Me         = imports.misc.extensionUtils.getCurrentExtension()
 const AppMenu    = Main.panel.statusArea.appMenu
 const Activities = Main.panel.statusArea.activities
-const Buttons    = Unite.imports.buttons
-const Handlers   = Unite.imports.handlers
+const Buttons    = Me.imports.buttons
+const Handlers   = Me.imports.handlers
+const Override   = Me.imports.overrides.helper
 
-var PanelExtension = class PanelExtension {
-  constructor(settings, key, callback) {
-    this.activated = false
-
-    const isActive = () => {
-      return callback.call(null, settings.get(key))
-    }
-
-    const onChange = () => {
-      const active = isActive()
-
-      if (active && !this.activated) {
-        this.activated = true
-        return this._init()
-      }
-
-      if (!active && this.activated) {
-        this.activated = false
-        return this._destroy()
-      }
-    }
-
-    this.activate = () => {
-      settings.connect(key, onChange.bind(this))
-      onChange()
-    }
-
-    this.destroy = () => {
-      if (this.activated) {
-        this._destroy()
-        this.activated = false
-      }
-    }
-  }
-}
-
-var WindowButtons = class WindowButtons extends PanelExtension {
-  constructor({ settings }) {
-    const active = val => val != 'never'
-    super(settings, 'show-window-buttons', active)
+var WindowButtons = class WindowButtons extends Handlers.Feature {
+  constructor() {
+    super('show-window-buttons', setting => setting != 'never')
   }
 
-  _init() {
+  activate() {
     this.theme    = 'default-dark'
     this.signals  = new Handlers.Signals()
     this.settings = new Handlers.Settings()
@@ -62,23 +30,19 @@ var WindowButtons = class WindowButtons extends PanelExtension {
     this.controls = new Buttons.WindowControls()
 
     this.signals.connect(
-      Main.overview, 'showing', this._onOverviewShowing.bind(this)
+      Main.overview, 'showing', this._syncVisible.bind(this)
     )
 
     this.signals.connect(
-      Main.overview, 'hiding', this._onOverviewHiding.bind(this)
+      Main.overview, 'hiding', this._syncVisible.bind(this)
     )
 
     this.signals.connect(
-      WinTracker, 'notify::focus-app', this._onFocusAppChange.bind(this)
+      WinTracker, 'notify::focus-app', this._syncVisible.bind(this)
     )
 
     this.settings.connect(
-      'window-buttons-layout', this._onLayoutChange.bind(this)
-    )
-
-    this.settings.connect(
-      'window-buttons-position', this._onPositionChange.bind(this)
+      'button-layout', this._onPositionChange.bind(this)
     )
 
     this.settings.connect(
@@ -95,7 +59,7 @@ var WindowButtons = class WindowButtons extends PanelExtension {
 
     this._onPositionChange()
     this._onThemeChange()
-    this._onOverviewHiding()
+    this._syncVisible()
   }
 
   get position() {
@@ -134,41 +98,26 @@ var WindowButtons = class WindowButtons extends PanelExtension {
     }
   }
 
-  _onOverviewShowing() {
-    this.controls.setVisible(false)
-  }
-
-  _onOverviewHiding() {
-    const focused = global.unite.focusWindow
-    this.controls.setVisible(focused && focused.showButtons)
-  }
-
-  _onFocusAppChange() {
-    const focused = AppMenu._targetApp
-
-    if (focused == null || focused.state != Shell.AppState.RUNNING) {
-      this.controls.setVisible(false)
-    }
-  }
-
   _onLayoutChange() {
     const buttons = this.settings.get('window-buttons-layout')
 
-    if (this.side == 'right' && this.position == 'left') {
+    if (this.side != this.position) {
       buttons.reverse()
     }
 
     this.controls.addButtons(buttons)
+    this._syncVisible()
   }
 
   _onPositionChange() {
-    const controls = this.controls.container
+    const controls  = this.controls.container
+    const container = controls.get_parent()
 
-    if (controls.reparent) {
-      controls.reparent(this.container)
-    } else {
-      controls.unparent()
-      controls.set_parent(this.container)
+    controls.add_style_class_name('window-controls-container')
+
+    if (container) {
+      container.remove_child(controls)
+      this.container.add_child(controls)
     }
 
     if (this.index != null) {
@@ -184,13 +133,25 @@ var WindowButtons = class WindowButtons extends PanelExtension {
     this.controls.remove_style_class_name(this.theme)
 
     this.theme = this.settings.get('window-buttons-theme')
-    const path = `themes/${this.theme}/stylesheet.css`
+    const path = `@/themes/${this.theme}/stylesheet.css`
 
     this.styles.addShellStyle('windowButtons', path)
     this.controls.add_style_class_name(this.theme)
   }
 
-  _destroy() {
+  _syncVisible() {
+    const overview = Main.overview.visibleTarget
+    const focusApp = WinTracker.focus_app || AppMenu._targetApp
+
+    if (!overview && focusApp && focusApp.state == Shell.AppState.RUNNING) {
+      const win = global.unite.focusWindow
+      this.controls.setVisible(win && win.showButtons)
+    } else {
+      this.controls.setVisible(false)
+    }
+  }
+
+  destroy() {
     this.controls.destroy()
 
     this.signals.disconnectAll()
@@ -199,21 +160,29 @@ var WindowButtons = class WindowButtons extends PanelExtension {
   }
 }
 
-var ExtendLeftBox = class ExtendLeftBox extends PanelExtension {
-  constructor({ settings }) {
-    const active = val => val == true
-    super(settings, 'extend-left-box', active)
+var ExtendLeftBox = class ExtendLeftBox extends Handlers.Feature {
+  constructor() {
+    super('extend-left-box', setting => setting == true)
+
+    Override.inject(this, 'panel', 'ExtendLeftBox')
   }
 
-  _init() {
+  activate() {
     this._default = Main.panel.__proto__.vfunc_allocate
-
-    Main.panel.__proto__[Gi.hook_up_vfunc_symbol]('allocate', (box, flags) => {
-      Main.panel.vfunc_allocate.call(Main.panel, box, flags)
-      this._allocate(Main.panel, box, flags)
-    })
+    this._injectAllocate()
 
     Main.panel.queue_relayout()
+  }
+
+  _injectAllocate() {
+    Main.panel.__proto__[Gi.hook_up_vfunc_symbol]('allocate', (box) => {
+      Main.panel.vfunc_allocate.call(Main.panel, box)
+      this._allocate(Main.panel, box)
+    })
+  }
+
+  _boxAllocate(box, childBox, flags) {
+    box.allocate(childBox)
   }
 
   _allocate(actor, box, flags) {
@@ -242,7 +211,7 @@ var ExtendLeftBox = class ExtendLeftBox extends PanelExtension {
       childBox.x2 = Math.min(Math.floor(sideWidth), leftNaturalWidth)
     }
 
-    leftBox.allocate(childBox, flags)
+    this._boxAllocate(leftBox, childBox, flags)
 
     childBox.y1 = 0
     childBox.y2 = allocHeight
@@ -255,7 +224,7 @@ var ExtendLeftBox = class ExtendLeftBox extends PanelExtension {
       childBox.x2 = childBox.x1 + centerNaturalWidth
     }
 
-    centerBox.allocate(childBox, flags)
+    this._boxAllocate(centerBox, childBox, flags)
 
     childBox.y1 = 0
     childBox.y2 = allocHeight
@@ -268,10 +237,10 @@ var ExtendLeftBox = class ExtendLeftBox extends PanelExtension {
       childBox.x2 = allocWidth
     }
 
-    rightBox.allocate(childBox, flags)
+    this._boxAllocate(rightBox, childBox, flags)
   }
 
-  _destroy() {
+  destroy() {
     Main.panel.__proto__[Gi.hook_up_vfunc_symbol]('allocate', this._default)
     this._default = null
 
@@ -279,13 +248,12 @@ var ExtendLeftBox = class ExtendLeftBox extends PanelExtension {
   }
 }
 
-var ActivitiesButton = class ActivitiesButton extends PanelExtension {
-  constructor({ settings }) {
-    const active = val => val != 'never'
-    super(settings, 'hide-activities-button', active)
+var ActivitiesButton = class ActivitiesButton extends Handlers.Feature {
+  constructor() {
+    super('hide-activities-button', setting => Activities && setting != 'never')
   }
 
-  _init() {
+  activate() {
     this.signals  = new Handlers.Signals()
     this.settings = new Handlers.Settings()
 
@@ -323,6 +291,7 @@ var ActivitiesButton = class ActivitiesButton extends PanelExtension {
   _syncVisible() {
     const button   = Activities.container
     const overview = Main.overview.visibleTarget
+    const focusApp = WinTracker.focus_app || AppMenu._targetApp
 
     if (this.hideButton == 'always') {
       return button.hide()
@@ -331,25 +300,26 @@ var ActivitiesButton = class ActivitiesButton extends PanelExtension {
     if (this.showDesktop) {
       button.visible = overview
     } else {
-      button.visible = overview || AppMenu._targetApp == null
+      button.visible = overview || focusApp == null
     }
   }
 
-  _destroy() {
-    Activities.container.show()
+  destroy() {
+    if (!Main.overview.isDummy) {
+      Activities.container.show()
+    }
 
     this.signals.disconnectAll()
     this.settings.disconnectAll()
   }
 }
 
-var DesktopName = class DesktopName extends PanelExtension {
-  constructor({ settings }) {
-    const active = val => val == true
-    super(settings, 'show-desktop-name', active)
+var DesktopName = class DesktopName extends Handlers.Feature {
+  constructor() {
+    super('show-desktop-name', setting => setting == true)
   }
 
-  _init() {
+  activate() {
     this.signals  = new Handlers.Signals()
     this.settings = new Handlers.Settings()
     this.label    = new Buttons.DesktopLabel()
@@ -382,20 +352,11 @@ var DesktopName = class DesktopName extends PanelExtension {
     this._syncVisible()
   }
 
-  get visibleWindows() {
-    const actors = global.get_window_actors()
-
-    return actors.some(({ metaWindow }) => {
-      const visible = metaWindow.showing_on_its_workspace()
-      return visible && !metaWindow.skip_taskbar
-    })
-  }
-
   _syncVisible() {
     const overview = Main.overview.visibleTarget
-    const visible  = !overview && AppMenu._targetApp == null
+    const focusApp = WinTracker.focus_app || AppMenu._targetApp
 
-    this.label.setVisible(visible && !this.visibleWindows)
+    this.label.setVisible(!overview && focusApp == null)
   }
 
   _onTextChanged() {
@@ -403,7 +364,7 @@ var DesktopName = class DesktopName extends PanelExtension {
     this.label.setText(text)
   }
 
-  _destroy() {
+  destroy() {
     this.label.destroy()
 
     this.signals.disconnectAll()
@@ -411,13 +372,12 @@ var DesktopName = class DesktopName extends PanelExtension {
   }
 }
 
-var TrayIcons = class TrayIcons extends PanelExtension {
-  constructor({ settings }) {
-    const active = val => val == true
-    super(settings, 'show-legacy-tray', active)
+var TrayIcons = class TrayIcons extends Handlers.Feature {
+  constructor() {
+    super('show-legacy-tray', setting => setting == true)
   }
 
-  _init() {
+  activate() {
     this.tray       = new Shell.TrayManager()
     this.settings   = new Handlers.Settings()
     this.indicators = new Buttons.TrayIndicator()
@@ -470,7 +430,7 @@ var TrayIcons = class TrayIcons extends PanelExtension {
     this.indicators.forEach(this._desaturateIcon.bind(this))
   }
 
-  _destroy() {
+  destroy() {
     this.tray = null
     System.gc()
 
@@ -479,33 +439,212 @@ var TrayIcons = class TrayIcons extends PanelExtension {
   }
 }
 
+var TitlebarActions = class TitlebarActions extends Handlers.Feature {
+  constructor() {
+    super('enable-titlebar-actions', setting => setting == true)
+  }
+
+  activate() {
+    this.signals  = new Handlers.Signals()
+    this.settings = new Handlers.Settings()
+
+    this.signals.connect(
+      Main.panel, 'button-press-event', this._onButtonPressEvent.bind(this)
+    )
+  }
+
+  _onButtonPressEvent(actor, event) {
+    if (Main.modalCount > 0 || actor != event.get_source()) {
+      return Clutter.EVENT_PROPAGATE
+    }
+
+    const focusWindow = global.unite.focusWindow
+
+    if (!focusWindow || !focusWindow.hideTitlebars) {
+      return Clutter.EVENT_PROPAGATE
+    }
+
+    const ccount = event.get_click_count()
+    const button = event.get_button()
+
+    let action = null
+
+    if (button == 1 && ccount == 2) {
+      action = this.settings.get('action-double-click-titlebar')
+    }
+
+    if (button == 2) {
+      action = this.settings.get('action-middle-click-titlebar')
+    }
+
+    if (button == 3) {
+      action = this.settings.get('action-right-click-titlebar')
+    }
+
+    if (action == 'menu') {
+      return this._openWindowMenu(focusWindow.win, event.get_coords()[0])
+    }
+
+    if (action && action != 'none') {
+      return this._handleClickAction(action, focusWindow)
+    }
+
+    return Clutter.EVENT_PROPAGATE
+  }
+
+  _handleClickAction(action, win) {
+    const mapping = {
+      'toggle-maximize':              'maximize',
+      'toggle-maximize-horizontally': 'maximizeX',
+      'toggle-maximize-vertically':   'maximizeY',
+      'toggle-shade':                 'shade',
+      'minimize':                     'minimize',
+      'lower':                        'lower'
+    }
+
+    const method = win[mapping[action]]
+
+    if (typeof method !== 'function') {
+      return Clutter.EVENT_PROPAGATE
+    }
+
+    method.call(win)
+    return Clutter.EVENT_STOP
+  }
+
+  _openWindowMenu(win, x) {
+    const size = Main.panel.height + 4
+    const rect = { x: x - size, y: 0, width: size * 2, height: size }
+    const type = Meta.WindowMenuType.WM
+
+    Main.wm._windowMenuManager.showWindowMenuForWindow(win, type, rect)
+    return Clutter.EVENT_STOP
+  }
+
+  destroy() {
+    this.signals.disconnectAll()
+    this.settings.disconnectAll()
+  }
+}
+
+var AppMenuCustomizer = class AppMenuCustomizer extends Handlers.Feature {
+  constructor() {
+    super('app-menu-max-width', setting => setting > 0)
+  }
+
+  activate() {
+    this.signals  = new Handlers.Signals()
+    this.settings = new Handlers.Settings()
+    this.tooltip  = new St.Label({ visible: false, style_class: 'dash-label' })
+
+    this.signals.connect(
+      AppMenu, 'notify::hover', this._onAppMenuHover.bind(this)
+    )
+
+    this.signals.connect(
+      AppMenu, 'button-press-event', this._onAppMenuClicked.bind(this)
+    )
+
+    this.settings.connect(
+      'app-menu-max-width', this._onMaxWidthChange.bind(this)
+    )
+
+    this.settings.connect(
+      'app-menu-ellipsize-mode', this._onEllipsizeModeChange.bind(this)
+    )
+
+    Main.uiGroup.add_child(this.tooltip)
+
+    this._onMaxWidthChange()
+  }
+
+  get maxWidth() {
+    return this.settings.get('app-menu-max-width')
+  }
+
+  get ellipsizeMode() {
+    return this.settings.get('app-menu-ellipsize-mode')
+  }
+
+  setLabelMaxWidth(width) {
+    const label = AppMenu._label
+    label && label.set_style('max-width' + (width ? `: ${width}px` : ''))
+  }
+
+  setTextEllipsizeMode(mode) {
+    const modeK = mode.toUpperCase()
+    const label = AppMenu._label
+
+    label && label.get_clutter_text().set_ellipsize(Pango.EllipsizeMode[modeK])
+  }
+
+  _onAppMenuHover(appMenu) {
+    if (!appMenu._label) return
+
+    this.isHovered = appMenu.get_hover()
+
+    if (!this.isHovered) {
+      return this.tooltip.hide()
+    }
+
+    GLib.timeout_add(GLib.PRIORITY_DEFAULT, 400, () => {
+      if (this.isHovered && !this.tooltip.visible) {
+        const [mouseX, mouseY] = global.get_pointer()
+
+        this.tooltip.set_position(mouseX + 20, mouseY)
+        this.tooltip.set_text(appMenu._label.get_text())
+        this.tooltip.show()
+      }
+
+      return GLib.SOURCE_REMOVE
+    })
+  }
+
+  _onAppMenuClicked() {
+    this.isHovered = false
+    this.tooltip.hide()
+  }
+
+  _onMaxWidthChange() {
+    this.setLabelMaxWidth(this.maxWidth)
+    this.setTextEllipsizeMode(this.ellipsizeMode)
+  }
+
+  _onEllipsizeModeChange() {
+    this.setTextEllipsizeMode(this.ellipsizeMode)
+  }
+
+  destroy() {
+    this.tooltip.destroy()
+
+    this.setLabelMaxWidth(null)
+    this.setTextEllipsizeMode('end')
+
+    this.signals.disconnectAll()
+    this.settings.disconnectAll()
+  }
+}
+
 var PanelManager = GObject.registerClass(
   class UnitePanelManager extends GObject.Object {
     _init() {
-      this.settings   = new Handlers.Settings()
-      this.buttons    = new WindowButtons(this)
-      this.extender   = new ExtendLeftBox(this)
-      this.activities = new ActivitiesButton(this)
-      this.desktop    = new DesktopName(this)
-      this.tray       = new TrayIcons(this)
+      this.features = new Handlers.Features()
+
+      this.features.add(WindowButtons)
+      this.features.add(ExtendLeftBox)
+      this.features.add(ActivitiesButton)
+      this.features.add(DesktopName)
+      this.features.add(TrayIcons)
+      this.features.add(TitlebarActions)
+      this.features.add(AppMenuCustomizer)
     }
 
     activate() {
-      this.buttons.activate()
-      this.extender.activate()
-      this.activities.activate()
-      this.desktop.activate()
-      this.tray.activate()
+      this.features.activate()
     }
 
     destroy() {
-      this.buttons.destroy()
-      this.extender.destroy()
-      this.activities.destroy()
-      this.desktop.destroy()
-      this.tray.destroy()
-
-      this.settings.disconnectAll()
+      this.features.destroy()
     }
   }
 )

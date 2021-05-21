@@ -1,12 +1,14 @@
-const Bytes    = imports.byteArray
-const GLib     = imports.gi.GLib
-const GObject  = imports.gi.GObject
-const Meta     = imports.gi.Meta
-const Main     = imports.ui.main
-const Util     = imports.misc.util
-const Unite    = imports.misc.extensionUtils.getCurrentExtension()
-const AppMenu  = Main.panel.statusArea.appMenu
-const Handlers = Unite.imports.handlers
+const Bytes      = imports.byteArray
+const GLib       = imports.gi.GLib
+const GObject    = imports.gi.GObject
+const Meta       = imports.gi.Meta
+const WinTracker = imports.gi.Shell.WindowTracker.get_default()
+const Main       = imports.ui.main
+const Util       = imports.misc.util
+const Me         = imports.misc.extensionUtils.getCurrentExtension()
+const AppMenu    = Main.panel.statusArea.appMenu
+const Handlers   = Me.imports.handlers
+const Override   = Me.imports.overrides.helper
 
 const VALID_TYPES = [
   Meta.WindowType.NORMAL,
@@ -20,6 +22,14 @@ const MOTIF_HINTS = '_MOTIF_WM_HINTS'
 
 const _SHOW_FLAGS = ['0x2', '0x0', '0x1', '0x0', '0x0']
 const _HIDE_FLAGS = ['0x2', '0x0', '0x2', '0x0', '0x0']
+
+function safeSpawn(command) {
+  try {
+    return GLib.spawn_command_line_sync(command)
+  } catch (e) {
+    return [false, Bytes.fromString('')]
+  }
+}
 
 function isValid(win) {
   return win && VALID_TYPES.includes(win.window_type)
@@ -37,7 +47,7 @@ function getXid(win) {
 }
 
 function getHint(xid, name, fallback) {
-  const result = GLib.spawn_command_line_sync(`xprop -id ${xid} ${name}`)
+  const result = safeSpawn(`xprop -id ${xid} ${name}`)
   const string = Bytes.toString(result[1])
 
   if (!string.match(/=/)) {
@@ -119,7 +129,7 @@ var ServerDecorations = class ServerDecorations {
 
   reset() {
     if (this.handle) {
-      setHint(this.xid, MOTIF_HINTS, this.initial)
+      setHint(this.xid, MOTIF_HINTS, _SHOW_FLAGS)
     }
   }
 }
@@ -168,6 +178,10 @@ var MetaWindow = GObject.registerClass(
       this.syncComponents()
     }
 
+    get app() {
+      return WinTracker.get_window_app(this.win)
+    }
+
     get hasFocus() {
       return this.win.has_focus()
     }
@@ -176,7 +190,7 @@ var MetaWindow = GObject.registerClass(
       if (this.showTitle) {
         return this.win.get_title()
       } else {
-        return AppMenu._targetApp.get_name()
+        return this.app.get_name()
       }
     }
 
@@ -244,6 +258,34 @@ var MetaWindow = GObject.registerClass(
       }
     }
 
+    maximizeX() {
+      if (this.win.maximized_horizontally) {
+        this.win.unmaximize(Meta.MaximizeFlags.HORIZONTAL)
+      } else {
+        this.win.maximize(Meta.MaximizeFlags.HORIZONTAL)
+      }
+    }
+
+    maximizeY() {
+      if (this.win.maximized_vertically) {
+        this.win.unmaximize(Meta.MaximizeFlags.VERTICAL)
+      } else {
+        this.win.maximize(Meta.MaximizeFlags.VERTICAL)
+      }
+    }
+
+    shade() {
+      if (this.win.is_shaded) {
+        this.win.shade(true)
+      } else {
+        this.win.unshade(true)
+      }
+    }
+
+    lower() {
+      this.win.lower()
+    }
+
     close() {
       const time = global.get_current_time()
       time && this.win.delete(time)
@@ -259,17 +301,21 @@ var MetaWindow = GObject.registerClass(
 
     syncControls() {
       if (this.hasFocus) {
-        const overview = Main.overview._visible
+        const overview = Main.overview.visibleTarget
         const controls = Main.panel.statusArea.uniteWindowControls
 
-        controls && controls.setVisible(this.showButtons && !overview)
+        controls && controls.setVisible(!overview && this.showButtons)
       }
     }
 
     syncAppmenu() {
-      if (this.hasFocus) {
-        const current = AppMenu._label.get_text()
-        current != this.title && AppMenu._label.set_text(this.title)
+      const label = AppMenu._label
+
+      if (label && this.hasFocus && this.title) {
+        const current = label.get_text()
+        const newText = this.title.replace(/\r?\n|\r/g, ' ')
+
+        current != newText && label.set_text(newText)
       }
     }
 
@@ -325,6 +371,10 @@ var WindowManager = GObject.registerClass(
       )
 
       this.signals.connect(
+        global.display, 'window-entered-monitor', this._onWindowEntered.bind(this)
+      )
+
+      this.signals.connect(
         global.display, 'notify::focus-window', this._onFocusWindow.bind(this)
       )
 
@@ -332,17 +382,15 @@ var WindowManager = GObject.registerClass(
         global.display, 'window-demands-attention', this._onAttention.bind(this)
       )
 
-      this.signals.connect(
-        AppMenu._label, 'notify::text', this._onAppmenuChanged.bind(this)
-      )
-
       this.settings.connect(
         'hide-window-titlebars', this._onStylesChange.bind(this)
       )
 
       this.settings.connect(
-        'window-buttons-position', this._onStylesChange.bind(this)
+        'button-layout', this._onStylesChange.bind(this)
       )
+
+      Override.inject(this, 'window', 'WindowManager')
     }
 
     get focusWindow() {
@@ -396,18 +444,15 @@ var WindowManager = GObject.registerClass(
       }
     }
 
-    _onFocusWindow(display) {
-      if (this.focusWindow) {
-        this.focusWindow.syncComponents()
+    _onWindowEntered(display, index, meta_window) {
+      if (isValid(meta_window)) {
+        this.setWindow(meta_window)
       }
     }
 
-    _onAppmenuChanged() {
-      const focused = this.focusWindow
-      const current = AppMenu._label.get_text()
-
-      if (focused && current != focused.title) {
-        AppMenu._label.set_text(focused.title)
+    _onFocusWindow(display) {
+      if (this.focusWindow) {
+        this.focusWindow.syncComponents()
       }
     }
 
@@ -420,11 +465,10 @@ var WindowManager = GObject.registerClass(
 
     _onStylesChange() {
       if (this.hideTitlebars != 'never') {
-        const variant = this.settings.get('window-buttons-position')
-        const folder  = `${Unite.path}/styles/buttons-${variant}`
-        const content = `@import url('${folder}/${this.hideTitlebars}.css');`
+        const side = this.settings.get('window-buttons-position')
+        const path = `@/buttons-${side}/${this.hideTitlebars}.css`
 
-        this.styles.addGtkStyle('windowDecorations', content)
+        this.styles.addGtkStyle('windowDecorations', path)
       } else {
         this.styles.deleteStyle('windowDecorations')
       }
@@ -434,6 +478,8 @@ var WindowManager = GObject.registerClass(
       GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
         const actors = global.get_window_actors()
         actors.forEach(actor => this._onMapWindow(null, actor))
+
+        return GLib.SOURCE_REMOVE
       })
 
       this._onStylesChange()
